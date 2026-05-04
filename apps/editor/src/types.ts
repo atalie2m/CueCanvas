@@ -207,6 +207,64 @@ export type HealthStatus = {
   messages: string[];
 };
 
+export type ObsConnectionRequest = {
+  host: string;
+  port: number;
+  password?: string;
+  mock?: boolean;
+};
+
+export type ObsConnectionStatus = {
+  connected: boolean;
+  host: string;
+  port: number;
+  obsVersion?: string;
+  websocketVersion?: string;
+  message: string;
+};
+
+export type ObsDesiredState = {
+  sceneName: string;
+  sourceName: string;
+  url: string;
+  stage: Stage;
+  shutdownWhenNotVisible: boolean;
+  refreshWhenActive: boolean;
+  customCss: string;
+};
+
+export type ObsObservedState = {
+  sceneExists: boolean;
+  sourceExists: boolean;
+  url: string;
+  width: number;
+  height: number;
+  shutdownWhenNotVisible: boolean;
+  refreshWhenActive: boolean;
+  customCss: string;
+  visibleInScenePath: boolean;
+  overlayConnected: boolean;
+};
+
+export type ObsIssue = {
+  ruleId: string;
+  severity: "error" | "warning" | "info";
+  message: string;
+};
+
+export type ObsSetupRequest = {
+  connection: ObsConnectionRequest;
+  desired: ObsDesiredState;
+};
+
+export type ObsSetupResponse = {
+  connection: ObsConnectionStatus;
+  desired: ObsDesiredState;
+  observed: ObsObservedState;
+  issues: ObsIssue[];
+  actions: string[];
+};
+
 export type OperationLogEntry = {
   id: string;
   at: string;
@@ -266,6 +324,13 @@ export type OverlayItem =
       frame: Rect;
       zIndex: number;
       fit: string;
+    }
+  | {
+      kind: "rect";
+      id: string;
+      frame: Rect;
+      zIndex: number;
+      style: { fill: string; opacity: number };
     }
   | { kind: "clear" }
   | { kind: "blackout" };

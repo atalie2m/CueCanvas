@@ -7,10 +7,14 @@
     "dev": "pnpm --parallel --filter @cuecanvas/editor --filter @cuecanvas/overlay dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test"
+    "test": "pnpm -r test",
+    "test:visual": "playwright test -c apps/overlay/playwright.config.ts"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@types/node": "^22.10.2",
+    "@types/pngjs": "^6.0.5",
+    "pngjs": "^7.0.0",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
   }

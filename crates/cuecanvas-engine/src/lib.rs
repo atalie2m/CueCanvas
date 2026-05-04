@@ -271,6 +271,49 @@ impl CueEngine {
         );
         Ok(restored)
     }
+
+    pub fn test_pattern_program(
+        run: &mut RunSession,
+        stage: Stage,
+        output_target_id: &str,
+        idempotency_key: &str,
+        actor: Actor,
+        now: impl Into<String>,
+    ) -> ProgramSnapshot {
+        if let Some(existing) = run.live_command_results.get(idempotency_key) {
+            return existing.clone();
+        }
+
+        let now = now.into();
+        let next_program_revision = run.revisions.program_revision + 1;
+        let overlay_state = OverlayState {
+            protocol_version: 1,
+            stage: stage.clone(),
+            program_revision: Some(next_program_revision),
+            items: test_pattern_items(&stage),
+        };
+        let program = emergency_program(
+            run,
+            output_target_id,
+            "test-pattern",
+            overlay_state,
+            next_program_revision,
+            now.clone(),
+        );
+        run.live_command_results
+            .insert(idempotency_key.to_string(), program.clone());
+        push_log(
+            run,
+            actor,
+            "live.testPattern",
+            format!("Displayed Test Pattern at ProgramRevision {next_program_revision}"),
+            None,
+            Some(next_program_revision),
+            Some(idempotency_key.to_string()),
+            now,
+        );
+        program
+    }
 }
 
 fn resolve_cue(
@@ -443,23 +486,42 @@ fn build_overlay_state(
                     let Some(text) = value.as_str() else {
                         continue;
                     };
+                    let frame = text_slot_frame(instance.frame, index);
+                    let style = TextStyle {
+                        font_family: "Inter, system-ui, sans-serif".to_string(),
+                        font_size: if index == 0 { 48 } else { 30 },
+                        color: "#f8fafc".to_string(),
+                        weight: if index == 0 {
+                            FontWeight::Bold
+                        } else {
+                            FontWeight::Semibold
+                        },
+                    };
+                    if text_overflows_frame(text, style.font_size, frame.width) {
+                        preflight_items.push(PreflightItem {
+                            rule_id: "renderer.textOverflow".to_string(),
+                            source: Origin::system(),
+                            severity: PreflightSeverity::Warning,
+                            scope: PreflightScope::TemplateInstance {
+                                template_instance_id: instance.id.clone(),
+                            },
+                            message: format!(
+                                "Text in slot '{}' may overflow the renderer frame",
+                                slot.label
+                            ),
+                            fix_actions: vec![FixAction::SelectCue {
+                                cue_id: cue.id.clone(),
+                            }],
+                        });
+                    }
                     items.push(OverlayItem::Text(OverlayText {
                         id: format!("{}-{}", instance.id, slot.key),
                         template_instance_id: instance.id.clone(),
                         slot_key: slot.key.clone(),
                         text: text.to_string(),
-                        frame: text_slot_frame(instance.frame, index),
+                        frame,
                         z_index: instance.z_index + index as i32,
-                        style: TextStyle {
-                            font_family: "Inter, system-ui, sans-serif".to_string(),
-                            font_size: if index == 0 { 48 } else { 30 },
-                            color: "#f8fafc".to_string(),
-                            weight: if index == 0 {
-                                FontWeight::Bold
-                            } else {
-                                FontWeight::Semibold
-                            },
-                        },
+                        style,
                     }));
                 }
                 SlotKind::AssetImage => {
@@ -528,6 +590,63 @@ fn collect_asset_manifest(overlay_state: &OverlayState) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+fn text_overflows_frame(text: &str, font_size: u32, frame_width: u32) -> bool {
+    let estimated_width = text.chars().count() as u32 * font_size / 2;
+    estimated_width > frame_width
+}
+
+fn test_pattern_items(stage: &Stage) -> Vec<OverlayItem> {
+    let colors = [
+        "#ffffff", "#facc15", "#22c55e", "#06b6d4", "#3b82f6", "#a855f7", "#ef4444",
+    ];
+    let bar_width = stage.width / colors.len() as u32;
+    let remainder = stage.width - (bar_width * colors.len() as u32);
+    let mut items = colors
+        .iter()
+        .enumerate()
+        .map(|(index, color)| {
+            OverlayItem::Rect(OverlayRect {
+                id: format!("test-pattern-bar-{index}"),
+                frame: Rect {
+                    x: (index as i32) * bar_width as i32,
+                    y: 0,
+                    width: if index == colors.len() - 1 {
+                        bar_width + remainder
+                    } else {
+                        bar_width
+                    },
+                    height: stage.height,
+                },
+                z_index: index as i32,
+                style: RectStyle {
+                    fill: (*color).to_string(),
+                    opacity: 100,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    items.push(OverlayItem::Text(OverlayText {
+        id: "test-pattern-label".to_string(),
+        template_instance_id: "test-pattern".to_string(),
+        slot_key: "label".to_string(),
+        text: "CueCanvas Test Pattern".to_string(),
+        frame: Rect {
+            x: (stage.width / 20) as i32,
+            y: (stage.height.saturating_sub(stage.height / 5)) as i32,
+            width: stage.width.saturating_sub(stage.width / 10),
+            height: stage.height / 11,
+        },
+        z_index: 20,
+        style: TextStyle {
+            font_family: "Inter, system-ui, sans-serif".to_string(),
+            font_size: 58,
+            color: "#0f172a".to_string(),
+            weight: FontWeight::Bold,
+        },
+    }));
+    items
 }
 
 fn is_empty_value(value: &Value) -> bool {
@@ -1078,6 +1197,23 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(run.operation_log.len(), 1);
+    }
+
+    #[test]
+    fn preview_reports_renderer_text_overflow_warning() {
+        let mut project = demo_project();
+        project.show_definitions[0].typed_entities.people[0].display_name =
+            "A very long lower-third primary speaker name that should overflow the frame"
+                .to_string();
+        let show = &project.show_definitions[0];
+        let mut run = project.run_sessions[0].clone();
+        run.revisions.preview_revision = 1;
+
+        let preview = CueEngine::preview_cue(show, &run, "cue-001", 1, NOW).unwrap();
+
+        assert!(preview.preflight_result.items.iter().any(|item| {
+            item.rule_id == "renderer.textOverflow" && item.severity == PreflightSeverity::Warning
+        }));
     }
 
     #[test]

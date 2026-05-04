@@ -97,6 +97,7 @@
             "typescript"
             "tsx"
             "playwright"
+            "playwright-driver"
             "eslint"
             "prettier"
           ];
@@ -125,6 +126,8 @@
             name = "cuecanvas-dev";
             packages = commonPackages ++ securityPackages ++ rustPackages ++ webPackages ++ darwinPackages;
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+            PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
             shellHook = ''
               ${config.pre-commit.installationScript}
               mkdir -p "$PWD/.direnv/bin"
@@ -141,6 +144,7 @@
             flakeCheck = false;
             settings.global.excludes = [
               "docs/Cue Canvas Proposal v5.2.md"
+              ".vscode/**"
               "apps/**/dist/**"
               "apps/**/*.tsbuildinfo"
             ];
@@ -159,6 +163,7 @@
           pre-commit.settings = {
             excludes = [
               "docs/Cue Canvas Proposal v5.2.md"
+              ".vscode/.*"
               "apps/.*/dist/.*"
               "apps/.*\\.tsbuildinfo"
             ];
@@ -194,6 +199,21 @@
               test-web = writeApp "cuecanvas-test-web" [ pkgs.nodejs_22 pkgs.pnpm ] ''
                 ${webInstall}
                 pnpm test "$@"
+              '';
+              test-visual = writeApp "cuecanvas-test-visual" [
+                pkgs.nodejs_22
+                pkgs.pnpm
+                pkgs.playwright-driver
+              ] ''
+                export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
+                export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+                ${webInstall}
+                pnpm test:visual "$@"
+              '';
+              security-audit = writeApp "cuecanvas-security-audit" securityPackages ''
+                gitleaks detect --source . --redact --no-banner
+                cargo audit
+                osv-scanner --lockfile Cargo.lock --lockfile pnpm-lock.yaml
               '';
               test = writeApp "cuecanvas-test" [ rustToolchain pkgs.nodejs_22 pkgs.pnpm ] ''
                 cargo test --workspace

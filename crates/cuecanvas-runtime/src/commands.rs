@@ -19,8 +19,8 @@ use cuecanvas_protocol::{
     EmergencyLivePayload, ImportMode, LiveStateTransitionPayload, PreflightDisplayItem,
     PreflightGroups, PreflightState, PreflightTotals, PreviewCuePayload, ReorderCuesPayload,
     RuntimeCommandEnvelope, RuntimeCommandResponse, RuntimeEvent, TakePayload,
-    TemplateInstancePayload, TypedEntityPayload, UpdateOutputTargetPayload, UpdateStagePayload,
-    WarningOverridePayload,
+    TemplateInstancePayload, TestPatternPayload, TypedEntityPayload, UpdateOutputTargetPayload,
+    UpdateStagePayload, WarningOverridePayload,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -577,6 +577,29 @@ pub fn dispatch_command(
                 _ => CueEngine::restore_program(run, &key, actor.clone(), now.clone())
                     .map_err(|error| CommandError::new(StatusCode::CONFLICT, error.to_string()))?,
             };
+            events.push(RuntimeEvent::ProgramChanged {
+                source: actor.clone(),
+                revision: run.revisions.runtime_revision,
+                payload: program.clone(),
+            });
+            json!(program)
+        }
+        "live.testPattern" => {
+            let payload: TestPatternPayload = decode(envelope.payload)?;
+            let stage = active_show(state)?.stage.clone();
+            let run = active_run_mut(state, payload.run_session_id.as_deref())?;
+            let key = envelope
+                .idempotency_key
+                .clone()
+                .unwrap_or_else(|| format!("test-pattern-{}", Uuid::new_v4()));
+            let program = CueEngine::test_pattern_program(
+                run,
+                stage,
+                &payload.output_target_id,
+                &key,
+                actor.clone(),
+                now.clone(),
+            );
             events.push(RuntimeEvent::ProgramChanged {
                 source: actor.clone(),
                 revision: run.revisions.runtime_revision,

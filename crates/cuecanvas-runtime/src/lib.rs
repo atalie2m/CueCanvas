@@ -8,11 +8,13 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
-        Path as AxumPath, Query, State,
+        DefaultBodyLimit, Path as AxumPath, Query, State,
         ws::{Message, WebSocketUpgrade},
     },
-    http::{HeaderMap, Response, StatusCode},
+    http::{HeaderMap, Request as HttpRequest, Response, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
@@ -22,7 +24,13 @@ use cuecanvas_data::{DataImportReport, DataImportRequest};
 use cuecanvas_engine::demo_project;
 use cuecanvas_model::{
     Actor, AssetKind, ConnectionState, HealthLevel, HealthStatus, PreviewSnapshot, ProgramSnapshot,
-    ProjectPackage,
+    ProjectPackage, Stage,
+};
+use cuecanvas_obs::{
+    BrowserSourceDesiredState, MockObsTransport, ObsConnectionRequest, ObsConnectionStatus,
+    ObsSetupRequest, ObsSetupResponse, apply_real, apply_with_transport, connect_real,
+    connect_with_transport, health_messages, setup_response, status_payload, verify_real,
+    verify_with_transport,
 };
 use cuecanvas_project::{ProjectIoError, load_project_package, save_project_package};
 use cuecanvas_protocol::{
@@ -43,6 +51,9 @@ pub struct RuntimeState {
     pub project: ProjectPackage,
     pub package_dir: Option<PathBuf>,
     pub tokens: RuntimeTokens,
+    pub security: RuntimeSecurityConfig,
+    rate_limits: BTreeMap<String, RateLimitBucket>,
+    pub obs_last_response: Option<ObsSetupResponse>,
     pub event_tx: broadcast::Sender<RuntimeEvent>,
     pub command_results: BTreeMap<String, RuntimeCommandResponse>,
 }
@@ -54,6 +65,9 @@ impl Default for RuntimeState {
             project: demo_project(),
             package_dir: None,
             tokens: RuntimeTokens::generate(),
+            security: RuntimeSecurityConfig::default(),
+            rate_limits: BTreeMap::new(),
+            obs_last_response: None,
             event_tx,
             command_results: BTreeMap::new(),
         }
@@ -67,6 +81,9 @@ impl RuntimeState {
             project,
             package_dir: None,
             tokens,
+            security: RuntimeSecurityConfig::default(),
+            rate_limits: BTreeMap::new(),
+            obs_last_response: None,
             event_tx,
             command_results: BTreeMap::new(),
         }
@@ -77,6 +94,7 @@ impl RuntimeState {
 pub struct RuntimeTokens {
     pub editor_token: String,
     pub overlay_token: String,
+    pub external_input_token: Option<String>,
 }
 
 impl RuntimeTokens {
@@ -84,6 +102,7 @@ impl RuntimeTokens {
         Self {
             editor_token: format!("editor-{}", Uuid::new_v4()),
             overlay_token: format!("overlay-{}", Uuid::new_v4()),
+            external_input_token: None,
         }
     }
 
@@ -92,19 +111,49 @@ impl RuntimeTokens {
         Self {
             editor_token: "test-editor-token".to_string(),
             overlay_token: "test-overlay-token".to_string(),
+            external_input_token: Some("test-external-input-token".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSecurityConfig {
+    pub external_input_enabled: bool,
+    pub max_payload_bytes: usize,
+    pub rate_limit_per_minute: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RateLimitBucket {
+    minute: u64,
+    count: u32,
+}
+
+impl Default for RuntimeSecurityConfig {
+    fn default() -> Self {
+        Self {
+            external_input_enabled: false,
+            max_payload_bytes: 1_048_576,
+            rate_limit_per_minute: 240,
         }
     }
 }
 
 pub fn app(state: SharedRuntimeState) -> Router {
+    let max_payload_bytes = RuntimeSecurityConfig::default().max_payload_bytes;
     Router::new()
         .route("/health", get(health))
         .route("/api/project", get(project))
         .route("/api/preflight", get(preflight))
         .route("/api/runtime/health", get(runtime_health))
+        .route("/api/obs/status", get(obs_status))
+        .route("/api/obs/connect", post(obs_connect))
+        .route("/api/obs/apply", post(obs_apply))
+        .route("/api/obs/verify", post(obs_verify))
         .route("/api/recovery/candidates", get(recovery_candidates))
         .route("/api/project/save", post(save_project))
         .route("/api/project/open", post(open_project))
+        .route("/api/external-input/update", post(external_input_update))
         .route("/api/commands", post(command))
         .route("/api/data/import", post(import_data))
         .route("/api/live/preview/:cue_id", post(preview_cue))
@@ -121,6 +170,11 @@ pub fn app(state: SharedRuntimeState) -> Router {
         .route("/overlay/program", get(overlay_program_html))
         .route("/ws/editor", get(editor_ws))
         .route("/ws/overlay/program", get(overlay_program_ws))
+        .layer(DefaultBodyLimit::max(max_payload_bytes))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            runtime_security_middleware,
+        ))
         .with_state(state)
 }
 
@@ -140,6 +194,46 @@ pub fn addr_for_port(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
+async fn runtime_security_middleware(
+    State(state): State<SharedRuntimeState>,
+    request: HttpRequest<Body>,
+    next: Next,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    if !valid_request_host(request.headers()) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Host header must target localhost",
+        ));
+    }
+    if !valid_request_origin(request.headers()) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Origin header must target localhost",
+        ));
+    }
+
+    let (max_payload_bytes, rate_limit_per_minute) = {
+        let state = state.lock().await;
+        (
+            state.security.max_payload_bytes,
+            state.security.rate_limit_per_minute,
+        )
+    };
+    if payload_exceeds_limit(request.headers(), max_payload_bytes) {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request payload exceeds the runtime limit",
+        ));
+    }
+
+    {
+        let mut state = state.lock().await;
+        apply_rate_limit(&mut state, request.headers(), rate_limit_per_minute)?;
+    }
+
+    Ok(next.run(request).await)
+}
+
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
@@ -154,6 +248,7 @@ struct AuthQuery {
     token: Option<String>,
     editor_token: Option<String>,
     overlay_token: Option<String>,
+    external_input_token: Option<String>,
 }
 
 async fn project(
@@ -190,7 +285,139 @@ async fn runtime_health(State(state): State<SharedRuntimeState>) -> Json<Value> 
         "outputConnectionState": run.map(|run| &run.output_connection_state),
         "obsHealth": run.map(|run| &run.obs_health),
         "overlayHealth": run.map(|run| &run.overlay_health),
+        "externalInputEnabled": state.security.external_input_enabled,
     }))
+}
+
+async fn obs_status(
+    State(state): State<SharedRuntimeState>,
+    Query(auth): Query<AuthQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let state = state.lock().await;
+    require_editor(&headers, &auth, &state.tokens)?;
+    if let Some(response) = &state.obs_last_response {
+        return Ok(Json(status_payload(response)));
+    }
+    let desired = desired_obs_state(&state.project, &state.tokens, &headers);
+    let connection = ObsConnectionStatus {
+        connected: false,
+        host: "127.0.0.1".to_string(),
+        port: 4455,
+        obs_version: None,
+        websocket_version: None,
+        message: "OBS has not been checked".to_string(),
+    };
+    let response = setup_response(
+        connection,
+        desired,
+        cuecanvas_obs::BrowserSourceObservedState::missing(),
+        vec![],
+    );
+    Ok(Json(status_payload(&response)))
+}
+
+async fn obs_connect(
+    State(state): State<SharedRuntimeState>,
+    Query(auth): Query<AuthQuery>,
+    headers: HeaderMap,
+    Json(request): Json<ObsConnectionRequest>,
+) -> Result<Json<ObsConnectionStatus>, (StatusCode, Json<Value>)> {
+    {
+        let state = state.lock().await;
+        require_editor(&headers, &auth, &state.tokens)?;
+    }
+
+    let result = if request.mock {
+        let mut transport = MockObsTransport::connected();
+        connect_with_transport(&mut transport, &request).await
+    } else {
+        connect_real(&request).await
+    };
+
+    match result {
+        Ok(status) => {
+            let mut state = state.lock().await;
+            update_obs_health(
+                &mut state.project,
+                HealthLevel::Healthy,
+                vec![status.message.clone()],
+            );
+            Ok(Json(status))
+        }
+        Err(error) => {
+            let mut state = state.lock().await;
+            update_obs_health(
+                &mut state.project,
+                HealthLevel::Error,
+                vec![error.to_string()],
+            );
+            Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("OBS connection failed: {error}"),
+            ))
+        }
+    }
+}
+
+async fn obs_apply(
+    State(state): State<SharedRuntimeState>,
+    Query(auth): Query<AuthQuery>,
+    headers: HeaderMap,
+    Json(mut request): Json<ObsSetupRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (overlay_connected, last_response) = {
+        let state = state.lock().await;
+        require_editor(&headers, &auth, &state.tokens)?;
+        request.desired = desired_obs_state_with_overrides(
+            &state.project,
+            &state.tokens,
+            &headers,
+            request.desired,
+        );
+        (
+            overlay_connected(&state.project),
+            state.obs_last_response.clone(),
+        )
+    };
+
+    let result = if request.connection.mock {
+        let mut transport = mock_transport_from_last(last_response);
+        apply_with_transport(&mut transport, &request, overlay_connected).await
+    } else {
+        apply_real(&request, overlay_connected).await
+    };
+    obs_response_result(state, result).await
+}
+
+async fn obs_verify(
+    State(state): State<SharedRuntimeState>,
+    Query(auth): Query<AuthQuery>,
+    headers: HeaderMap,
+    Json(mut request): Json<ObsSetupRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (overlay_connected, last_response) = {
+        let state = state.lock().await;
+        require_editor(&headers, &auth, &state.tokens)?;
+        request.desired = desired_obs_state_with_overrides(
+            &state.project,
+            &state.tokens,
+            &headers,
+            request.desired,
+        );
+        (
+            overlay_connected(&state.project),
+            state.obs_last_response.clone(),
+        )
+    };
+
+    let result = if request.connection.mock {
+        let mut transport = mock_transport_from_last(last_response);
+        verify_with_transport(&mut transport, &request, overlay_connected).await
+    } else {
+        verify_real(&request, overlay_connected).await
+    };
+    obs_response_result(state, result).await
 }
 
 async fn recovery_candidates(
@@ -276,6 +503,26 @@ async fn open_project(
         package_dir: package_dir.to_string_lossy().to_string(),
         project,
     }))
+}
+
+async fn external_input_update(
+    State(state): State<SharedRuntimeState>,
+    Query(auth): Query<AuthQuery>,
+    headers: HeaderMap,
+    Json(_request): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let state = state.lock().await;
+    if !state.security.external_input_enabled {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "External input API is disabled for MVP",
+        ));
+    }
+    require_external_input(&headers, &auth, &state.tokens)?;
+    Err(api_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "External input API is not implemented in MVP",
+    ))
 }
 
 async fn command(
@@ -579,6 +826,9 @@ async fn overlay_program_html(
             el.src = '/assets/' + encodeURIComponent(item.assetId) + query;
             el.alt = '';
             el.style.objectFit = item.fit;
+          } else if (item.kind === 'rect') {
+            el.style.background = item.style.fill;
+            el.style.opacity = Math.max(0, Math.min(100, item.style.opacity)) / 100;
           }
           root.appendChild(el);
         }
@@ -802,6 +1052,226 @@ fn mark_overlay_disconnected(project: &mut ProjectPackage) {
         };
         run.revisions.runtime_revision += 1;
     }
+}
+
+async fn obs_response_result(
+    state: SharedRuntimeState,
+    result: Result<ObsSetupResponse, cuecanvas_obs::ObsError>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match result {
+        Ok(response) => {
+            let payload = status_payload(&response);
+            let (level, messages) = health_messages(&response.issues);
+            let mut state = state.lock().await;
+            update_obs_health(&mut state.project, level, messages);
+            state.obs_last_response = Some(response);
+            if let Ok(preflight) = commands::preflight_state_for_project(&state.project) {
+                let revision = state
+                    .project
+                    .run_sessions
+                    .first()
+                    .map(|run| run.revisions.runtime_revision)
+                    .unwrap_or_default();
+                let _ = state.event_tx.send(RuntimeEvent::PreflightChanged {
+                    source: Actor::System,
+                    revision,
+                    payload: json!(preflight),
+                });
+            }
+            Ok(Json(payload))
+        }
+        Err(error) => {
+            let mut state = state.lock().await;
+            update_obs_health(
+                &mut state.project,
+                HealthLevel::Error,
+                vec![error.to_string()],
+            );
+            Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("OBS setup failed: {error}"),
+            ))
+        }
+    }
+}
+
+fn update_obs_health(project: &mut ProjectPackage, status: HealthLevel, messages: Vec<String>) {
+    if let Some(run) = project.run_sessions.first_mut() {
+        run.obs_health = HealthStatus { status, messages };
+        run.revisions.runtime_revision += 1;
+    }
+}
+
+fn mock_transport_from_last(last_response: Option<ObsSetupResponse>) -> MockObsTransport {
+    let mut transport = MockObsTransport::connected();
+    if let Some(response) = last_response {
+        transport.observed.insert(
+            (
+                response.desired.scene_name.clone(),
+                response.desired.source_name.clone(),
+            ),
+            response.observed,
+        );
+    }
+    transport
+}
+
+fn overlay_connected(project: &ProjectPackage) -> bool {
+    project
+        .run_sessions
+        .first()
+        .is_some_and(|run| run.output_connection_state == ConnectionState::Connected)
+}
+
+fn desired_obs_state(
+    project: &ProjectPackage,
+    tokens: &RuntimeTokens,
+    headers: &HeaderMap,
+) -> BrowserSourceDesiredState {
+    desired_obs_state_with_overrides(
+        project,
+        tokens,
+        headers,
+        BrowserSourceDesiredState::new(
+            String::new(),
+            Stage {
+                width: 0,
+                height: 0,
+            },
+        ),
+    )
+}
+
+fn desired_obs_state_with_overrides(
+    project: &ProjectPackage,
+    tokens: &RuntimeTokens,
+    headers: &HeaderMap,
+    overrides: BrowserSourceDesiredState,
+) -> BrowserSourceDesiredState {
+    let stage = project
+        .show_definitions
+        .first()
+        .and_then(|show| {
+            show.output_targets
+                .first()
+                .map(|target| target.stage.clone())
+        })
+        .or_else(|| {
+            project
+                .show_definitions
+                .first()
+                .map(|show| show.stage.clone())
+        })
+        .unwrap_or(Stage {
+            width: 1920,
+            height: 1080,
+        });
+    let mut desired = BrowserSourceDesiredState::new(overlay_program_url(headers, tokens), stage);
+    if !overrides.scene_name.trim().is_empty() {
+        desired.scene_name = overrides.scene_name;
+    }
+    if !overrides.source_name.trim().is_empty() {
+        desired.source_name = overrides.source_name;
+    }
+    if !overrides.custom_css.trim().is_empty() {
+        desired.custom_css = overrides.custom_css;
+    }
+    desired.shutdown_when_not_visible = overrides.shutdown_when_not_visible;
+    desired.refresh_when_active = overrides.refresh_when_active;
+    desired
+}
+
+fn overlay_program_url(headers: &HeaderMap, tokens: &RuntimeTokens) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| valid_local_host_header(host))
+        .unwrap_or("127.0.0.1:4317");
+    format!(
+        "http://{host}/overlay/program?token={}",
+        tokens.overlay_token
+    )
+}
+
+fn valid_local_host_header(host: &str) -> bool {
+    let host_without_port = host
+        .strip_prefix('[')
+        .and_then(|value| value.split(']').next())
+        .unwrap_or_else(|| host.split(':').next().unwrap_or(host));
+    matches!(host_without_port, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn valid_request_host(headers: &HeaderMap) -> bool {
+    headers
+        .get("host")
+        .map(|value| value.to_str().ok().is_some_and(valid_local_host_header))
+        .unwrap_or(true)
+}
+
+fn valid_request_origin(headers: &HeaderMap) -> bool {
+    headers
+        .get("origin")
+        .map(|value| value.to_str().ok().is_some_and(valid_local_origin))
+        .unwrap_or(true)
+}
+
+fn valid_local_origin(origin: &str) -> bool {
+    let Ok(uri) = origin.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return false;
+    }
+    uri.host().is_some_and(valid_local_host_header)
+}
+
+fn payload_exceeds_limit(headers: &HeaderMap, max_payload_bytes: usize) -> bool {
+    headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > max_payload_bytes)
+}
+
+fn apply_rate_limit(
+    state: &mut RuntimeState,
+    headers: &HeaderMap,
+    rate_limit_per_minute: u32,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if rate_limit_per_minute == 0 {
+        return Ok(());
+    }
+    let key = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| valid_local_host_header(host))
+        .unwrap_or("localhost")
+        .to_string();
+    let minute = current_minute();
+    let bucket = state
+        .rate_limits
+        .entry(key)
+        .or_insert(RateLimitBucket { minute, count: 0 });
+    if bucket.minute != minute {
+        bucket.minute = minute;
+        bucket.count = 0;
+    }
+    bucket.count = bucket.count.saturating_add(1);
+    if bucket.count > rate_limit_per_minute {
+        Err(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Local request rate limit exceeded",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn current_minute() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() / 60)
+        .unwrap_or_default()
 }
 
 async fn serve_project_asset(
@@ -1092,6 +1562,37 @@ fn require_overlay(
     }
 }
 
+fn require_external_input(
+    headers: &HeaderMap,
+    auth: &AuthQuery,
+    tokens: &RuntimeTokens,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(expected) = tokens.external_input_token.as_deref() else {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "External input token is not configured",
+        ));
+    };
+    if bearer_matches(headers, expected)
+        || header_matches(headers, "x-cuecanvas-external-input-token", expected)
+        || auth
+            .external_input_token
+            .as_deref()
+            .is_some_and(|token| secure_eq(token, expected))
+        || auth
+            .token
+            .as_deref()
+            .is_some_and(|token| secure_eq(token, expected))
+    {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "Missing or invalid external input token",
+        ))
+    }
+}
+
 fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get("authorization")
@@ -1136,7 +1637,50 @@ fn command_error(error: commands::CommandError) -> (StatusCode, Json<Value>) {
 }
 
 fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({ "error": message.into() })))
+    (
+        status,
+        Json(json!({ "error": redact_sensitive(message.into()) })),
+    )
+}
+
+fn redact_sensitive(mut message: String) -> String {
+    for prefix in ["editor-", "overlay-", "external-input-"] {
+        let mut search_from = 0;
+        while let Some(offset) = message[search_from..].find(prefix) {
+            let start = search_from + offset;
+            let end = message[start..]
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric()
+                        || character == '-'
+                        || character == '_'
+                        || character == '.')
+                })
+                .map(|end| start + end)
+                .unwrap_or_else(|| message.len());
+            message.replace_range(start..end, &format!("{prefix}<redacted>"));
+            search_from = start + prefix.len() + "<redacted>".len();
+        }
+    }
+
+    for marker in [
+        "token=",
+        "editorToken=",
+        "overlayToken=",
+        "externalInputToken=",
+    ] {
+        let mut search_from = 0;
+        while let Some(offset) = message[search_from..].find(marker) {
+            let start = search_from + offset + marker.len();
+            let end = message[start..]
+                .find(|character: char| matches!(character, '&' | '"' | '\'' | ' ' | '\n'))
+                .map(|end| start + end)
+                .unwrap_or_else(|| message.len());
+            message.replace_range(start..end, "<redacted>");
+            search_from = start + "<redacted>".len();
+        }
+    }
+
+    message
 }
 
 fn now_string() -> String {
@@ -1150,6 +1694,7 @@ fn now_string() -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1159,7 +1704,8 @@ mod tests {
         http::{Request, StatusCode},
     };
     use cuecanvas_model::{
-        HealthLevel, HealthStatus, PreviewSnapshot, ProgramSnapshot, ProjectPackage,
+        Asset, AssetKind, HealthLevel, HealthStatus, Origin, OverlayItem, PreviewSnapshot,
+        ProgramSnapshot, ProjectPackage,
     };
     use serde::de::DeserializeOwned;
     use serde_json::json;
@@ -1266,6 +1812,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_separates_editor_overlay_and_external_input_tokens() {
+        let tokens = RuntimeTokens::for_tests();
+        let app = app(state_with_tokens(tokens.clone()));
+
+        let editor_snapshot_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/overlay/program/snapshot?token=test-editor-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor_snapshot_response.status(), StatusCode::UNAUTHORIZED);
+
+        let editor_overlay_html_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/overlay/program?token=test-editor-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            editor_overlay_html_response.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let missing_overlay_html_query_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/overlay/program")
+                    .header("x-cuecanvas-overlay-token", &tokens.overlay_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            missing_overlay_html_query_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let editor_asset_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/assets/asset-cat-photo?token=test-editor-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor_asset_response.status(), StatusCode::UNAUTHORIZED);
+
+        let editor_font_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/fonts/font-inter?token=test-editor-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor_font_response.status(), StatusCode::UNAUTHORIZED);
+
+        let editor_overlay_ws_response = app
+            .clone()
+            .oneshot(overlay_ws_request(
+                "/ws/overlay/program?token=test-editor-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            editor_overlay_ws_response.status(),
+            StatusCode::UPGRADE_REQUIRED
+        );
+        let overlay_ws_auth = require_overlay(
+            &HeaderMap::new(),
+            &AuthQuery {
+                token: Some(tokens.editor_token.clone()),
+                ..AuthQuery::default()
+            },
+            &tokens,
+        );
+        assert_eq!(overlay_ws_auth.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        let external_input_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/external-input/update?token=test-external-input-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(external_input_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn runtime_security_middleware_rejects_bad_host_origin_payload_and_rate() {
+        let tokens = RuntimeTokens::for_tests();
+        let state = state_with_tokens(tokens.clone());
+        {
+            let mut state = state.lock().await;
+            state.security.max_payload_bytes = 8;
+            state.security.rate_limit_per_minute = 2;
+        }
+        let app = app(state);
+
+        let bad_host_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .header("host", "evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_host_response.status(), StatusCode::FORBIDDEN);
+
+        let bad_origin_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/project")
+                    .header("origin", "https://evil.example")
+                    .header("x-cuecanvas-editor-token", &tokens.editor_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_origin_response.status(), StatusCode::FORBIDDEN);
+
+        let oversized_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/commands")
+                    .header("x-cuecanvas-editor-token", &tokens.editor_token)
+                    .header("content-type", "application/json")
+                    .header("content-length", "64")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let rate_limited_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rate_limited_response.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_route_rejects_traversal_and_safe_errors_redact_tokens() {
+        let tokens = RuntimeTokens {
+            editor_token: "editor-secret-token".to_string(),
+            overlay_token: "overlay-secret-token".to_string(),
+            external_input_token: Some("external-input-secret-token".to_string()),
+        };
+        let state = connected_state_with_tokens(tokens.clone());
+        let package_dir = temp_package_dir("asset-traversal");
+        let outside_path = package_dir.parent().unwrap().join("outside.png");
+        let image_dir = package_dir.join("assets/images");
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("ok.png"), b"ok").unwrap();
+        fs::write(&outside_path, b"outside").unwrap();
+        {
+            let mut state = state.lock().await;
+            state.package_dir = Some(package_dir.clone());
+            state.project.show_definitions[0].assets[0].path = "../outside.png".to_string();
+            state.project.show_definitions[0].assets.push(Asset {
+                id: "asset-leaky".to_string(),
+                kind: AssetKind::Image,
+                path: "assets/images/overlay-secret-token.png".to_string(),
+                origin: Origin::system(),
+                extensions: BTreeMap::new(),
+            });
+        }
+        let app = app(state);
+
+        let traversal_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/assets/asset-cat-photo?token=overlay-secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(traversal_response.status(), StatusCode::FORBIDDEN);
+
+        let leaky_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/assets/asset-leaky?token=overlay-secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(leaky_response.status(), StatusCode::NOT_FOUND);
+        let body: Value = response_json(leaky_response).await;
+        let message = body["error"].as_str().unwrap();
+        assert!(!message.contains("overlay-secret-token"));
+        assert!(message.contains("overlay-<redacted>"));
+
+        let _ = fs::remove_dir_all(package_dir);
+        let _ = fs::remove_file(outside_path);
+    }
+
+    #[tokio::test]
     async fn runtime_take_is_blocked_when_program_output_is_disconnected() {
         let tokens = RuntimeTokens::for_tests();
         let app = app(state_with_tokens(tokens.clone()));
@@ -1340,6 +2146,160 @@ mod tests {
             }
         }
         assert!(saw_program);
+    }
+
+    #[tokio::test]
+    async fn test_pattern_command_commits_rect_program_and_broadcasts_event() {
+        let tokens = RuntimeTokens::for_tests();
+        let state = connected_state_with_tokens(tokens.clone());
+        let mut rx = {
+            let state = state.lock().await;
+            state.event_tx.subscribe()
+        };
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/commands")
+                    .header("x-cuecanvas-editor-token", &tokens.editor_token)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "command": "live.testPattern",
+                            "actor": { "kind": "user", "user_id": "local-user" },
+                            "expectedRevision": null,
+                            "idempotencyKey": "route-test-pattern",
+                            "payload": { "outputTargetId": "output-program-obs" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: RuntimeCommandResponse = response_json(response).await;
+        let program: ProgramSnapshot = serde_json::from_value(body.result).unwrap();
+        assert_eq!(program.source_cue_id, "test-pattern");
+        assert!(
+            program
+                .overlay_state
+                .items
+                .iter()
+                .any(|item| matches!(item, OverlayItem::Rect(_)))
+        );
+
+        let mut saw_program = false;
+        for _ in 0..8 {
+            let event = rx.recv().await.unwrap();
+            if matches!(
+                event,
+                RuntimeEvent::ProgramChanged { payload, .. } if payload.id == program.id
+            ) {
+                saw_program = true;
+                break;
+            }
+        }
+        assert!(saw_program);
+    }
+
+    #[tokio::test]
+    async fn obs_routes_apply_mock_setup_with_runtime_overlay_url() {
+        let tokens = RuntimeTokens::for_tests();
+        let state = connected_state_with_tokens(tokens.clone());
+        let app = app(state.clone());
+
+        let overlay_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/obs/apply")
+                    .header("x-cuecanvas-overlay-token", &tokens.overlay_token)
+                    .header("content-type", "application/json")
+                    .body(Body::from(obs_setup_payload("ignored-secret").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overlay_response.status(), StatusCode::UNAUTHORIZED);
+
+        let apply_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/obs/apply")
+                    .header("host", "127.0.0.1:4999")
+                    .header("x-cuecanvas-editor-token", &tokens.editor_token)
+                    .header("content-type", "application/json")
+                    .body(Body::from(obs_setup_payload("super-secret").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply_response.status(), StatusCode::OK);
+        let applied: Value = response_json(apply_response).await;
+        assert_eq!(
+            applied["desired"]["url"],
+            json!("http://127.0.0.1:4999/overlay/program?token=test-overlay-token")
+        );
+        assert_eq!(applied["observed"]["url"], applied["desired"]["url"]);
+        assert_eq!(applied["issues"], json!([]));
+        assert!(
+            applied["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action.as_str().unwrap().contains("Created Browser Source"))
+        );
+
+        let verify_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/obs/verify")
+                    .header("host", "127.0.0.1:4999")
+                    .header("x-cuecanvas-editor-token", &tokens.editor_token)
+                    .header("content-type", "application/json")
+                    .body(Body::from(obs_setup_payload("super-secret").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify_response.status(), StatusCode::OK);
+        let verified: Value = response_json(verify_response).await;
+        assert_eq!(verified["issues"], json!([]));
+
+        let project_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/project")
+                    .header("x-cuecanvas-editor-token", &tokens.editor_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let project_body = String::from_utf8(
+            to_bytes(project_response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!project_body.contains("super-secret"));
+        assert!(!project_body.contains("test-overlay-token"));
+
+        let state = state.lock().await;
+        assert_eq!(
+            state.project.run_sessions[0].obs_health.status,
+            HealthLevel::Healthy
+        );
     }
 
     #[tokio::test]
@@ -1619,6 +2579,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asset_and_font_routes_require_overlay_token_and_match_asset_kind() {
+        let tokens = RuntimeTokens::for_tests();
+        let state = connected_state_with_tokens(tokens.clone());
+        let package_dir = temp_package_dir("asset-font-route");
+        let image_dir = package_dir.join("assets/images");
+        let font_dir = package_dir.join("assets/fonts");
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::create_dir_all(&font_dir).unwrap();
+        fs::write(image_dir.join("cat.png"), b"fake png").unwrap();
+        fs::write(font_dir.join("inter.woff2"), b"fake font").unwrap();
+        {
+            let mut state = state.lock().await;
+            state.package_dir = Some(package_dir.clone());
+            state.project.show_definitions[0].assets.push(Asset {
+                id: "font-inter".to_string(),
+                kind: AssetKind::Font,
+                path: "assets/fonts/inter.woff2".to_string(),
+                origin: Origin::system(),
+                extensions: BTreeMap::new(),
+            });
+        }
+        let app = app(state);
+
+        let editor_asset_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/assets/asset-cat-photo")
+                    .header("x-cuecanvas-editor-token", &tokens.editor_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor_asset_response.status(), StatusCode::UNAUTHORIZED);
+
+        let font_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/fonts/font-inter?token=test-overlay-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(font_response.status(), StatusCode::OK);
+        assert_eq!(font_response.headers()["content-type"], "font/woff2");
+        assert_eq!(
+            to_bytes(font_response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"fake font"
+        );
+
+        let image_as_font_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/fonts/asset-cat-photo?token=test-overlay-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image_as_font_response.status(), StatusCode::NOT_FOUND);
+
+        let font_as_asset_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/assets/font-inter?token=test-overlay-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(font_as_asset_response.status(), StatusCode::NOT_FOUND);
+
+        let _ = fs::remove_dir_all(package_dir);
+    }
+
+    #[tokio::test]
     async fn runtime_save_and_open_recover_latest_program_snapshot() {
         let tokens = RuntimeTokens::for_tests();
         let source_app = app(connected_state_with_tokens(tokens.clone()));
@@ -1814,6 +2861,38 @@ mod tests {
             ],
             "replaceExisting": true
         })
+    }
+
+    fn obs_setup_payload(password: &str) -> Value {
+        json!({
+            "connection": {
+                "host": "127.0.0.1",
+                "port": 4455,
+                "password": password,
+                "mock": true
+            },
+            "desired": {
+                "sceneName": "CueCanvas Graphics",
+                "sourceName": "CueCanvas Program",
+                "url": "http://example.invalid/stale-tokenized-url",
+                "stage": { "width": 1, "height": 1 },
+                "shutdownWhenNotVisible": false,
+                "refreshWhenActive": false,
+                "customCss": "html, body { margin: 0; background: transparent; overflow: hidden; }"
+            }
+        })
+    }
+
+    fn overlay_ws_request(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .unwrap()
     }
 
     async fn response_json<T: DeserializeOwned>(response: Response<Body>) -> T {

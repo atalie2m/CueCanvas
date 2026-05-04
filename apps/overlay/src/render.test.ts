@@ -52,4 +52,25 @@ describe("renderOverlay", () => {
     expect(image?.getAttribute("src")).toBe("/assets/asset-cat-photo");
     expect(image?.getAttribute("alt")).toBe("");
   });
+
+  it("renders rect items for test patterns", () => {
+    const root = document.createElement("div");
+    renderOverlay(root, {
+      protocolVersion: 1,
+      stage: { width: 1920, height: 1080 },
+      items: [
+        {
+          kind: "rect",
+          id: "bar-1",
+          frame: { x: 0, y: 0, width: 100, height: 1080 },
+          zIndex: 1,
+          style: { fill: "#ffffff", opacity: 75 },
+        },
+      ],
+    });
+
+    const rect = root.querySelector("[data-item-id='bar-1']") as HTMLElement;
+    expect(rect.style.background).toBe("#ffffff");
+    expect(rect.style.opacity).toBe("0.75");
+  });
 });

@@ -27,6 +27,13 @@ export type OverlayItem =
       zIndex: number;
       fit: "cover" | "contain";
     }
+  | {
+      kind: "rect";
+      id: string;
+      frame: Frame;
+      zIndex: number;
+      style: { fill: string; opacity: number };
+    }
   | { kind: "clear" }
   | { kind: "blackout" };
 
@@ -75,10 +82,15 @@ export function renderOverlay(root: HTMLElement, state: OverlayState | null) {
           : item.style.weight === "semibold"
             ? "650"
             : "450";
-    } else {
+    } else if (item.kind === "image") {
       element.setAttribute("src", assetUrl(item.assetId));
       element.setAttribute("alt", "");
       element.style.objectFit = item.fit;
+    } else {
+      element.style.background = item.style.fill;
+      element.style.opacity = String(
+        Math.max(0, Math.min(100, item.style.opacity)) / 100,
+      );
     }
     root.appendChild(element);
   }

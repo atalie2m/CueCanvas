@@ -81,6 +81,13 @@ pub struct EmergencyLivePayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct TestPatternPayload {
+    pub run_session_id: Option<String>,
+    pub output_target_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CuePayload {
     pub show_definition_id: Option<String>,
     pub cue: Cue,

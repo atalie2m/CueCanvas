@@ -31,6 +31,7 @@ cuecanvas-preflight = { path = "crates/cuecanvas-preflight" }
 cuecanvas-project = { path = "crates/cuecanvas-project" }
 cuecanvas-protocol = { path = "crates/cuecanvas-protocol" }
 futures-util = "0.3"
+obws = "0.15.0"
 schemars = { version = "0.8", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

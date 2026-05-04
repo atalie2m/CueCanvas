@@ -30,8 +30,9 @@ body,
   display: flex;
   align-items: center;
   overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  line-break: auto;
+  overflow-wrap: anywhere;
+  white-space: normal;
   text-shadow: 0 8px 26px rgba(0, 0, 0, 0.48);
 }
 
@@ -42,6 +43,10 @@ body,
   background: rgba(15, 23, 42, 0.72);
   color: rgba(255, 255, 255, 0.72);
   font-size: 13px;
+}
+
+.rect {
+  background: currentColor;
 }
 
 .blackout {

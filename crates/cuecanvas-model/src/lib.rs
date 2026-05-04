@@ -593,6 +593,7 @@ pub struct OverlayState {
 pub enum OverlayItem {
     Text(OverlayText),
     Image(OverlayImage),
+    Rect(OverlayRect),
     Clear,
     Blackout,
 }
@@ -619,6 +620,22 @@ pub struct OverlayImage {
     pub frame: Rect,
     pub z_index: i32,
     pub fit: ImageFit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayRect {
+    pub id: String,
+    pub frame: Rect,
+    pub z_index: i32,
+    pub style: RectStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RectStyle {
+    pub fill: String,
+    pub opacity: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

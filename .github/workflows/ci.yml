@@ -33,3 +33,12 @@ jobs:
       - uses: cachix/install-nix-action@v30
       - name: macOS host tests
         run: nix run .#test-macos
+
+  security-audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+      - name: Secret and dependency audit
+        run: nix run .#security-audit

@@ -12,6 +12,7 @@ axum.workspace = true
 cuecanvas-engine.workspace = true
 cuecanvas-data.workspace = true
 cuecanvas-model.workspace = true
+cuecanvas-obs.workspace = true
 cuecanvas-preflight.workspace = true
 cuecanvas-protocol.workspace = true
 cuecanvas-project.workspace = true

@@ -38,6 +38,9 @@ import type {
   ImportMode,
   LiveState,
   LocalSlot,
+  ObsConnectionRequest,
+  ObsDesiredState,
+  ObsSetupResponse,
   Origin,
   PreflightItem,
   PreflightState,
@@ -123,6 +126,13 @@ export function App() {
     null,
   );
   const [isImporting, setIsImporting] = useState(false);
+  const [obsConnection, setObsConnection] = useState<ObsConnectionRequest>({
+    host: "127.0.0.1",
+    port: 4455,
+    password: "",
+    mock: false,
+  });
+  const [obsSetup, setObsSetup] = useState<ObsSetupResponse | null>(null);
 
   const show = project?.showDefinitions[0] ?? null;
   const run = project?.runSessions[0] ?? null;
@@ -183,15 +193,36 @@ export function App() {
       ),
     [templateDefinitions],
   );
+  const obsDesired = useMemo<ObsDesiredState>(
+    () => ({
+      sceneName: obsSetup?.desired.sceneName ?? "CueCanvas Graphics",
+      sourceName: obsSetup?.desired.sourceName ?? "CueCanvas Program",
+      url: obsSetup?.desired.url ?? "",
+      stage: show?.stage ?? { width: 1920, height: 1080 },
+      shutdownWhenNotVisible: false,
+      refreshWhenActive: false,
+      customCss:
+        obsSetup?.desired.customCss ??
+        "html, body { margin: 0; background: transparent; overflow: hidden; }",
+    }),
+    [obsSetup?.desired, show?.stage],
+  );
 
   const loadProject = useCallback(async () => {
     try {
-      const [projectResponse, snapshotResponse, preflightResponse] =
-        await Promise.all([
-          fetch(`${runtimeBase}/api/project`, { headers: editorAuthHeaders }),
-          fetch(`${runtimeBase}${overlaySnapshotPath}`),
-          fetch(`${runtimeBase}/api/preflight`, { headers: editorAuthHeaders }),
-        ]);
+      const [
+        projectResponse,
+        snapshotResponse,
+        preflightResponse,
+        obsResponse,
+      ] = await Promise.all([
+        fetch(`${runtimeBase}/api/project`, { headers: editorAuthHeaders }),
+        fetch(`${runtimeBase}${overlaySnapshotPath}`),
+        fetch(`${runtimeBase}/api/preflight`, { headers: editorAuthHeaders }),
+        fetch(`${runtimeBase}/api/obs/status`, {
+          headers: editorAuthHeaders,
+        }),
+      ]);
       if (!projectResponse.ok)
         throw new Error("Runtime project API is unavailable");
       setProject(await projectResponse.json());
@@ -200,6 +231,9 @@ export function App() {
       }
       if (preflightResponse.ok) {
         setPreflightState(await preflightResponse.json());
+      }
+      if (obsResponse.ok) {
+        setObsSetup(await obsResponse.json());
       }
       setStatus("Runtime connected");
     } catch (error) {
@@ -382,6 +416,64 @@ export function App() {
       );
     } catch (error) {
       setStatus(error instanceof Error ? error.message : `${kind} failed`);
+    }
+  }
+
+  async function testPattern() {
+    try {
+      setProgram(
+        await sendCommand<ProgramSnapshot>(
+          "live.testPattern",
+          { outputTargetId: "output-program-obs" },
+          { idempotencyKey: `editor-test-pattern-${Date.now()}` },
+        ),
+      );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Test Pattern failed");
+    }
+  }
+
+  async function connectObs() {
+    try {
+      const response = await fetch(`${runtimeBase}/api/obs/connect`, {
+        method: "POST",
+        headers: { ...editorAuthHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify(obsConnectionPayload(obsConnection)),
+      });
+      if (!response.ok) throw new Error(await readError(response));
+      const body = (await response.json()) as { message?: string };
+      setStatus(body.message ?? "OBS connected");
+      await loadProject();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "OBS connect failed");
+    }
+  }
+
+  async function applyObsSetup() {
+    await sendObsSetupRequest("/api/obs/apply", "OBS setup applied");
+  }
+
+  async function verifyObsSetup() {
+    await sendObsSetupRequest("/api/obs/verify", "OBS setup verified");
+  }
+
+  async function sendObsSetupRequest(path: string, successMessage: string) {
+    try {
+      const response = await fetch(`${runtimeBase}${path}`, {
+        method: "POST",
+        headers: { ...editorAuthHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          connection: obsConnectionPayload(obsConnection),
+          desired: obsDesired,
+        }),
+      });
+      if (!response.ok) throw new Error(await readError(response));
+      const body = (await response.json()) as ObsSetupResponse;
+      setObsSetup(body);
+      setStatus(successMessage);
+      await loadProject();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "OBS setup failed");
     }
   }
 
@@ -782,9 +874,26 @@ export function App() {
             <Undo2 size={16} />
             Restore
           </button>
+          <button type="button" onClick={() => void testPattern()}>
+            <MonitorUp size={16} />
+            Test Pattern
+          </button>
         </section>
 
         <section className="product-grid">
+          <Panel title="OBS Setup">
+            <ObsSetupPanel
+              connection={obsConnection}
+              desired={obsDesired}
+              setup={obsSetup}
+              onConnectionChange={setObsConnection}
+              onConnect={() => void connectObs()}
+              onApply={() => void applyObsSetup()}
+              onVerify={() => void verifyObsSetup()}
+              onTestPattern={() => void testPattern()}
+            />
+          </Panel>
+
           <Panel title="Template Library">
             <TemplateLibrary
               definitions={templateDefinitions}
@@ -1183,6 +1292,176 @@ function PreflightPanel({
             </ul>
           </section>
         ) : null,
+      )}
+    </div>
+  );
+}
+
+export function ObsSetupPanel({
+  connection,
+  desired,
+  setup,
+  onConnectionChange,
+  onConnect,
+  onApply,
+  onVerify,
+  onTestPattern,
+}: {
+  connection: ObsConnectionRequest;
+  desired: ObsDesiredState;
+  setup: ObsSetupResponse | null;
+  onConnectionChange: (connection: ObsConnectionRequest) => void;
+  onConnect: () => void;
+  onApply: () => void;
+  onVerify: () => void;
+  onTestPattern: () => void;
+}) {
+  const issues = setup?.issues ?? [];
+  const errorCount = issues.filter(
+    (issue) => issue.severity === "error",
+  ).length;
+  const warningCount = issues.filter(
+    (issue) => issue.severity === "warning",
+  ).length;
+
+  return (
+    <div className="obs-setup">
+      <div className="field-grid">
+        <label>
+          Host
+          <input
+            value={connection.host}
+            onChange={(event) =>
+              onConnectionChange({
+                ...connection,
+                host: event.currentTarget.value,
+              })
+            }
+          />
+        </label>
+        <label>
+          Port
+          <input
+            inputMode="numeric"
+            value={connection.port}
+            onChange={(event) =>
+              onConnectionChange({
+                ...connection,
+                port: Number(event.currentTarget.value) || 4455,
+              })
+            }
+          />
+        </label>
+        <label>
+          Password
+          <input
+            type="password"
+            value={connection.password ?? ""}
+            onChange={(event) =>
+              onConnectionChange({
+                ...connection,
+                password: event.currentTarget.value,
+              })
+            }
+          />
+        </label>
+        <label className="checkbox-field">
+          <input
+            checked={Boolean(connection.mock)}
+            type="checkbox"
+            onChange={(event) =>
+              onConnectionChange({
+                ...connection,
+                mock: event.currentTarget.checked,
+              })
+            }
+          />
+          Mock OBS
+        </label>
+      </div>
+
+      <dl className="obs-target">
+        <div>
+          <dt>Scene</dt>
+          <dd>{desired.sceneName}</dd>
+        </div>
+        <div>
+          <dt>Source</dt>
+          <dd>{desired.sourceName}</dd>
+        </div>
+        <div>
+          <dt>Size</dt>
+          <dd>
+            {desired.stage.width}x{desired.stage.height}
+          </dd>
+        </div>
+        <div>
+          <dt>Overlay URL</dt>
+          <dd>
+            {setup?.desired.url || "Runtime will fill this at apply time"}
+          </dd>
+        </div>
+      </dl>
+
+      <div className="panel-actions">
+        <button type="button" onClick={onConnect}>
+          <Activity size={15} />
+          Connect
+        </button>
+        <button type="button" onClick={onApply}>
+          <Save size={15} />
+          Apply
+        </button>
+        <button type="button" onClick={onVerify}>
+          <CheckCircle2 size={15} />
+          Verify
+        </button>
+        <button type="button" onClick={onTestPattern}>
+          <MonitorUp size={15} />
+          Test Pattern
+        </button>
+      </div>
+
+      <div className="obs-summary">
+        <HealthPill
+          label="OBS verified"
+          status={
+            errorCount > 0 ? "error" : warningCount > 0 ? "warning" : "healthy"
+          }
+          detail={`${errorCount} errors / ${warningCount} warnings`}
+        />
+        <HealthPill
+          label="Overlay"
+          status={setup?.observed.overlayConnected ? "healthy" : "error"}
+          detail={
+            setup?.observed.overlayConnected
+              ? "last render acknowledged"
+              : "not connected"
+          }
+        />
+      </div>
+
+      {setup?.actions.length ? (
+        <ul className="obs-actions">
+          {setup.actions.map((action) => (
+            <li key={action}>{action}</li>
+          ))}
+        </ul>
+      ) : null}
+
+      {issues.length ? (
+        <ul className="obs-issues">
+          {issues.map((issue) => (
+            <li key={`${issue.ruleId}-${issue.message}`}>
+              <strong>{issue.ruleId}</strong>
+              <span>{issue.message}</span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="muted">
+          High-confidence preview; OBS verified when connected.
+        </p>
       )}
     </div>
   );
@@ -2298,6 +2577,15 @@ function handleFixAction(
 ) {
   if (action.kind === "refreshPreview") onRefreshPreview();
   if (action.kind === "selectCue") onSelectCue(action.cueId);
+}
+
+function obsConnectionPayload(connection: ObsConnectionRequest) {
+  return {
+    host: connection.host.trim() || "127.0.0.1",
+    port: connection.port || 4455,
+    password: connection.password?.trim() || undefined,
+    mock: Boolean(connection.mock),
+  };
 }
 
 function originLabel(origin?: Origin) {
