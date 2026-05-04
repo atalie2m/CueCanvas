@@ -1,0 +1,46 @@
+[workspace]
+members = [
+  "crates/cuecanvas-cli",
+  "crates/cuecanvas-data",
+  "crates/cuecanvas-engine",
+  "crates/cuecanvas-extension",
+  "crates/cuecanvas-model",
+  "crates/cuecanvas-obs",
+  "crates/cuecanvas-preflight",
+  "crates/cuecanvas-project",
+  "crates/cuecanvas-protocol",
+  "crates/cuecanvas-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/atalie2m/CueCanvas"
+rust-version = "1.82"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["ws"] }
+cuecanvas-engine = { path = "crates/cuecanvas-engine" }
+cuecanvas-data = { path = "crates/cuecanvas-data" }
+cuecanvas-extension = { path = "crates/cuecanvas-extension" }
+cuecanvas-model = { path = "crates/cuecanvas-model" }
+cuecanvas-obs = { path = "crates/cuecanvas-obs" }
+cuecanvas-preflight = { path = "crates/cuecanvas-preflight" }
+cuecanvas-project = { path = "crates/cuecanvas-project" }
+cuecanvas-protocol = { path = "crates/cuecanvas-protocol" }
+futures-util = "0.3"
+schemars = { version = "0.8", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "1"
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+uuid = { version = "1", features = ["v4", "serde"] }

@@ -1,0 +1,35 @@
+name: CueCanvas
+options:
+  bundleIdPrefix: com.atalie2m
+  deploymentTarget:
+    macOS: "14.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+targets:
+  CueCanvasHost:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/CueCanvasHost
+    dependencies:
+      - sdk: Security.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.atalie2m.CueCanvas
+        INFOPLIST_KEY_CFBundleDisplayName: CueCanvas
+        INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
+        CODE_SIGN_STYLE: Automatic
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleName: CueCanvas
+        CFBundleDisplayName: CueCanvas
+        NSHumanReadableCopyright: ""
+  CueCanvasHostTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/CueCanvasHostTests
+    dependencies:
+      - target: CueCanvasHost

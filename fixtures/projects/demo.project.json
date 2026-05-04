@@ -1,0 +1,323 @@
+{
+  "formatVersion": 5,
+  "migrationsApplied": ["v5-extension-readiness"],
+  "metadata": {
+    "id": "project-demo",
+    "name": "CueCanvas Demo",
+    "createdAt": "2026-05-04T00:00:00Z",
+    "updatedAt": "2026-05-04T00:00:00Z"
+  },
+  "showDefinitions": [
+    {
+      "id": "show-main",
+      "revision": 1,
+      "name": "Main Event",
+      "stage": {
+        "width": 1920,
+        "height": 1080
+      },
+      "outputTargets": [
+        {
+          "id": "output-program-obs",
+          "name": "OBS Program Overlay",
+          "kind": "obsBrowserSource",
+          "stage": {
+            "width": 1920,
+            "height": 1080
+          },
+          "overlayUrl": "http://127.0.0.1:4317/overlay/program",
+          "origin": {
+            "kind": "system"
+          },
+          "extensions": {}
+        }
+      ],
+      "assets": [
+        {
+          "id": "asset-cat-photo",
+          "kind": "image",
+          "path": "assets/images/cat.png",
+          "origin": {
+            "kind": "import",
+            "source": "demo-fixture"
+          },
+          "extensions": {}
+        },
+        {
+          "id": "asset-dog-photo",
+          "kind": "image",
+          "path": "assets/images/dog.png",
+          "origin": {
+            "kind": "import",
+            "source": "demo-fixture"
+          },
+          "extensions": {}
+        }
+      ],
+      "templateDefinitions": [
+        {
+          "id": "template-lower-third-basic",
+          "name": "Basic Lower Third",
+          "kind": "lowerThird",
+          "version": 1,
+          "localSlots": [
+            {
+              "key": "primaryText",
+              "kind": "text",
+              "label": "Primary Text",
+              "required": true,
+              "maxLength": 32,
+              "fallback": null
+            },
+            {
+              "key": "secondaryText",
+              "kind": "text",
+              "label": "Secondary Text",
+              "required": false,
+              "maxLength": 48,
+              "fallback": null
+            },
+            {
+              "key": "portrait",
+              "kind": "assetImage",
+              "label": "Portrait",
+              "required": false,
+              "maxLength": null,
+              "fallback": null
+            }
+          ],
+          "variants": [
+            {
+              "id": "default",
+              "name": "Default"
+            }
+          ],
+          "origin": {
+            "kind": "system"
+          },
+          "extensions": {}
+        }
+      ],
+      "templateInstances": [
+        {
+          "id": "instance-main-lower-third",
+          "name": "Main Lower Third",
+          "templateDefinitionId": "template-lower-third-basic",
+          "templateVersionPolicy": "latestCompatible",
+          "frame": {
+            "x": 120,
+            "y": 760,
+            "width": 900,
+            "height": 184
+          },
+          "zIndex": 10,
+          "variantId": "default",
+          "slotBindings": {
+            "portrait": {
+              "entityType": "people",
+              "field": "photo"
+            },
+            "primaryText": {
+              "entityType": "people",
+              "field": "displayName"
+            },
+            "secondaryText": {
+              "entityType": "people",
+              "field": "role"
+            }
+          },
+          "visibleByDefault": false,
+          "origin": {
+            "kind": "system"
+          },
+          "extensions": {}
+        }
+      ],
+      "typedEntities": {
+        "people": [
+          {
+            "id": "person-cat",
+            "displayName": "Cat",
+            "role": "CTO",
+            "organization": "CueCanvas",
+            "photo": "asset-cat-photo",
+            "origin": {
+              "kind": "import",
+              "source": "demo-fixture"
+            },
+            "extensions": {}
+          },
+          {
+            "id": "person-dog",
+            "displayName": "Dog",
+            "role": "CFO",
+            "organization": "CueCanvas",
+            "photo": "asset-dog-photo",
+            "origin": {
+              "kind": "import",
+              "source": "demo-fixture"
+            },
+            "extensions": {}
+          }
+        ],
+        "sessions": [
+          {
+            "id": "session-opening",
+            "title": "Opening",
+            "track": "Main",
+            "startTime": "09:00",
+            "speakerRefs": ["person-cat"],
+            "origin": {
+              "kind": "import",
+              "source": "demo-fixture"
+            },
+            "extensions": {}
+          }
+        ],
+        "sponsors": [
+          {
+            "id": "sponsor-acme",
+            "name": "ACME",
+            "logo": null,
+            "tier": "Gold",
+            "origin": {
+              "kind": "import",
+              "source": "demo-fixture"
+            },
+            "extensions": {}
+          }
+        ]
+      },
+      "dataTables": [],
+      "cueSheet": {
+        "cues": [
+          {
+            "id": "cue-001",
+            "number": "001",
+            "segment": "Demo",
+            "name": "CTO Cat Lower Third",
+            "mode": "absolute",
+            "cueType": "lowerThird",
+            "entityRefs": {
+              "person": {
+                "entityType": "people",
+                "entityId": "person-cat"
+              }
+            },
+            "slotOverrides": {},
+            "templateStates": [
+              {
+                "templateInstanceId": "instance-main-lower-third",
+                "visible": true
+              }
+            ],
+            "transition": {
+              "kind": "cut"
+            },
+            "operatorNotes": "Take after speaker reaches mark",
+            "origin": {
+              "kind": "user",
+              "user_id": "local-user"
+            },
+            "extensions": {
+              "com.example.future-pack": {
+                "sourceRow": "001"
+              }
+            }
+          },
+          {
+            "id": "cue-002",
+            "number": "002",
+            "segment": "Demo",
+            "name": "CFO Dog Lower Third",
+            "mode": "absolute",
+            "cueType": "lowerThird",
+            "entityRefs": {
+              "person": {
+                "entityType": "people",
+                "entityId": "person-dog"
+              }
+            },
+            "slotOverrides": {},
+            "templateStates": [
+              {
+                "templateInstanceId": "instance-main-lower-third",
+                "visible": true
+              }
+            ],
+            "transition": {
+              "kind": "cut"
+            },
+            "operatorNotes": "Take after speaker reaches mark",
+            "origin": {
+              "kind": "user",
+              "user_id": "local-user"
+            },
+            "extensions": {
+              "com.example.future-pack": {
+                "sourceRow": "002"
+              }
+            }
+          }
+        ]
+      },
+      "showSettings": {},
+      "origin": {
+        "kind": "system"
+      },
+      "extensions": {}
+    }
+  ],
+  "runSessions": [
+    {
+      "id": "run-main-rehearsal",
+      "showDefinitionId": "show-main",
+      "showDefinitionRevision": 1,
+      "liveState": "rehearsal",
+      "previewSnapshot": null,
+      "programSnapshot": null,
+      "retainedProgramSnapshot": null,
+      "outputConnectionState": "disconnected",
+      "obsHealth": {
+        "status": "unknown",
+        "messages": []
+      },
+      "overlayHealth": {
+        "status": "unknown",
+        "messages": []
+      },
+      "warningOverrides": {},
+      "operationLog": [],
+      "revisions": {
+        "projectRevision": 1,
+        "showDefinitionRevision": 1,
+        "dataRevision": 1,
+        "previewRevision": 0,
+        "programRevision": 0,
+        "runtimeRevision": 1
+      },
+      "liveCommandResults": {},
+      "runSettings": {},
+      "extensions": {}
+    }
+  ],
+  "extensionRegistry": {
+    "installedPlugins": [],
+    "knownOrigins": [
+      {
+        "origin": {
+          "kind": "plugin",
+          "plugin_id": "com.example.future-pack",
+          "plugin_version": "1.0.0"
+        },
+        "status": "missing"
+      }
+    ]
+  },
+  "settings": {},
+  "extensions": {
+    "com.example.future-pack": {
+      "preserved": true
+    }
+  }
+}

@@ -1,0 +1,16 @@
+.DS_Store
+.direnv/
+.env
+.pre-commit-config.yaml
+target/
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+*.xcresult
+DerivedData/
+apps/macos/CueCanvas.xcodeproj/
+apps/macos/Generated/
+*.cuecanvas/autosave/*.tmp
