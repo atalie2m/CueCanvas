@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "RFC 6455 WebSocket handshake example in the runtime test"
+condition = "AND"
+regexTarget = "match"
+paths = ['^crates/cuecanvas-runtime/src/lib\.rs$']
+regexes = ['dGhlIHNhbXBsZSBub25jZQ==']
