@@ -1,0 +1,20 @@
+[package]
+name = "cuecanvas-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cuecanvas"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+cuecanvas-engine.workspace = true
+cuecanvas-model.workspace = true
+cuecanvas-protocol.workspace = true
+cuecanvas-project.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
